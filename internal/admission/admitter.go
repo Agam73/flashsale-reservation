@@ -41,41 +41,73 @@ func NewAdmitter(ctx context.Context, ratePerSecond int) *Admitter {
 
 // Join enqueues the caller and blocks until either they're admitted or
 // ctx is cancelled (e.g. the buyer's HTTP request disconnects). It
-// returns the caller's queue position at the moment they joined.
-//
-// TODO(you): implement Join. It needs to:
-//
-//  1. Build a joinRequest with buffered (size 1) position and admitted
-//     channels, so the loop's sends never block on a caller who already
-//     gave up.
-//  2. Send that request on a.requests -- in a select, also watching
-//     ctx.Done(), so a caller can't block forever if the loop isn't
-//     ready to receive.
-//  3. Wait for a value on position (also selecting on ctx.Done()), then
-//     return it along with the admitted channel so the caller can wait
-//     on that separately.
+// returns the caller's queue position at the moment they joined, and the
+// (already-closed, by the time Join returns successfully) admitted
+// channel for the caller's own bookkeeping.
 func (a *Admitter) Join(ctx context.Context) (position int, admitted <-chan struct{}, err error) {
-	panic("not implemented")
+	req := joinRequest{
+		position: make(chan int, 1),
+		admitted: make(chan struct{}),
+	}
+
+	select {
+	case a.requests <- req:
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	}
+
+	var pos int
+	select {
+	case pos = <-req.position:
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	}
+
+	select {
+	case <-req.admitted:
+		return pos, req.admitted, nil
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	}
 }
 
 // run is the admitter's single owning goroutine. It is the only code in
 // this package that ever touches the queue -- that's what makes it safe
-// without a mutex.
+// without a mutex. It holds a FIFO queue, admits the front of the queue
+// once per tick of the rate limiter, and exits when ctx is cancelled.
 //
-// TODO(you): implement run. It needs to:
-//
-//  1. Hold a FIFO queue of joinRequest (a plain slice is fine).
-//  2. Create a time.Ticker at a.rate and defer ticker.Stop().
-//  3. Loop on a select with three cases:
-//     - a new request arrives on a.requests: append it to the queue and
-//     send it its position (len(queue)-1) on its position channel.
-//     - the ticker fires: if the queue is non-empty, pop the front
-//     request and close its admitted channel.
-//     - ctx.Done(): stop looping, close a.done, and return. (Don't worry
-//     about notifying requests still stuck in the queue -- Phase 8
-//     covers shutdown semantics for in-flight work properly.)
+// Known limitation, deliberately unhandled here: a caller already
+// blocked in Join's first select (trying to enqueue) with a ctx that
+// never cancels will hang if this loop exits first, since nobody is left
+// to receive on a.requests. Phase 8 covers proper shutdown semantics for
+// in-flight work.
 func (a *Admitter) run(ctx context.Context) {
-	panic("not implemented")
+	defer close(a.done)
+
+	ticker := time.NewTicker(a.rate)
+	defer ticker.Stop()
+
+	var queue []joinRequest
+	var nextPosition int // monotonic: len(queue) shrinks as people get admitted, this doesn't
+
+	for {
+		select {
+		case req := <-a.requests:
+			queue = append(queue, req)
+			req.position <- nextPosition
+			nextPosition++
+
+		case <-ticker.C:
+			if len(queue) > 0 {
+				next := queue[0]
+				queue = queue[1:]
+				close(next.admitted)
+			}
+
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // Shutdown blocks until the admitter's loop has fully exited.
