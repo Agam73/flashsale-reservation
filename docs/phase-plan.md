@@ -10,7 +10,7 @@ checkable path through it.
 - [x] **Phase 1 -- Architecture & requirements**
       Requirements drafted (throughput, latency, delivery guarantee,
       consistency model, fairness rule, reservation TTL). Repo scaffolded.
-- [ ] **Phase 2 -- Go fundamentals**
+- [x] **Phase 2 -- Go fundamentals**
       Waiting-room admission logic: goroutines, channels, context,
       graceful shutdown. Built as real code for this project, not toy
       examples.
