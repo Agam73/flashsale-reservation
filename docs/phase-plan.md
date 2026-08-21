@@ -15,10 +15,19 @@ checkable path through it.
       graceful shutdown. Built as real code for this project, not toy
       examples.
 - [ ] **Phase 3 -- Postgres & data model**
-      Schema for items, reservations, orders. Migrations.
-- [ ] **Phase 4 -- Go API service**
+      Schema for items, reservations, orders. Migrations. (Built and
+      verified against a real Postgres instance -- not yet merged into
+      this repo. `migrations/`, `scripts/smoke_test.sql`, and
+      `docs/schema.md` land at the repo root once pushed.)
+- [x] **Phase 4 -- Go API service**
       waiting-room-api + checkout-api over HTTP. Redis-only fast path,
-      no Kafka yet.
+      no Kafka yet. Buyers join a per-item FIFO queue in
+      waiting-room-api (Phase 2's Admitter, now with one instance per
+      item ID); admission grants a short-lived Redis token that
+      checkout-api requires before it'll atomically decrement the
+      item's fast-path inventory counter. No durable reservation is
+      created yet -- that's Phase 6, once Kafka + decision-service +
+      Postgres are wired together.
 - [ ] **Phase 5 -- Kafka fundamentals**
       Manually produce/consume messages via the CLI and Kafka UI. Build
       intuition for topics, partitions, offsets, consumer groups before

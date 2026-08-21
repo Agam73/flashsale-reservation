@@ -1,2 +1,18 @@
-.env
+# Go
+/bin/
+*.exe
+*.test
+ 
+# Python
+__pycache__/
+*.pyc
 .venv/
+venv/
+ 
+# Env / secrets
+.env
+.env.*
+!.env.example
+ 
+# OS
+.DS_Store
