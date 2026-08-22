@@ -14,11 +14,8 @@ checkable path through it.
       Waiting-room admission logic: goroutines, channels, context,
       graceful shutdown. Built as real code for this project, not toy
       examples.
-- [ ] **Phase 3 -- Postgres & data model**
-      Schema for items, reservations, orders. Migrations. (Built and
-      verified against a real Postgres instance -- not yet merged into
-      this repo. `migrations/`, `scripts/smoke_test.sql`, and
-      `docs/schema.md` land at the repo root once pushed.)
+- [x] **Phase 3 -- Postgres & data model**
+      Schema for items, reservations, orders. Migrations.
 - [x] **Phase 4 -- Go API service**
       waiting-room-api + checkout-api over HTTP. Redis-only fast path,
       no Kafka yet. Buyers join a per-item FIFO queue in
@@ -28,14 +25,19 @@ checkable path through it.
       item's fast-path inventory counter. No durable reservation is
       created yet -- that's Phase 6, once Kafka + decision-service +
       Postgres are wired together.
-- [ ] **Phase 5 -- Kafka fundamentals**
+- [x] **Phase 5 -- Kafka fundamentals**
       Manually produce/consume messages via the CLI and Kafka UI. Build
       intuition for topics, partitions, offsets, consumer groups before
       writing a line of Go against them.
-- [ ] **Phase 6 -- Producers/consumers**
+- [x] **Phase 6 -- Producers/consumers**
       Real Kafka producer in checkout-api (partitioned by item ID). Real
       consumer in decision-service. This is where overselling gets
-      prevented for real.
+      prevented for real. Core correctness logic
+      (`internal/decision.ProcessAttempt`) verified directly against
+      Postgres, including a 50-goroutine concurrency test against 10
+      units of stock. Kafka wire-level behavior (partition routing,
+      consumer group rebalancing, end-to-end buyer flow) verified on
+      the actual dev machine -- see `docs/phase6.md`.
 - [ ] **Phase 7 -- Worker architecture**
       expiry-worker as a proper worker-pool pattern.
 - [ ] **Phase 8 -- Reliability & failure handling**

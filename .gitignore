@@ -1,18 +1,55 @@
-# Go
-/bin/
-*.exe
-*.test
- 
-# Python
-__pycache__/
-*.pyc
-.venv/
-venv/
- 
-# Env / secrets
+# --- Environment / secrets ---
 .env
 .env.*
 !.env.example
- 
-# OS
+
+# --- Go ---
+# Compiled binaries from cmd/* (waiting-room-api, checkout-api, decision-service, expiry-worker)
+/bin/
+/cmd/*/waiting-room-api
+/cmd/*/checkout-api
+/cmd/*/decision-service
+/cmd/*/expiry-worker
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+go.work
+go.work.sum
+
+# --- Python (services/risk-service) ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Docker / local data ---
+# Named volumes are managed by Docker itself; ignore any bind-mounted local data dirs
+pgdata/
+.docker/
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
 .DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Test / coverage artifacts ---
+coverage.out
+coverage.html

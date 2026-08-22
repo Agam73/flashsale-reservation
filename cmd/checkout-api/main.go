@@ -1,16 +1,16 @@
 // checkout-api does the synchronous, Redis-only fast path for a
-// purchase attempt: confirm the buyer actually came through the
+// purchase attempt -- confirm the buyer actually came through the
 // waiting room, then atomically decrement the item's fast-path
-// inventory counter.
+// inventory counter -- and then publishes the attempt to Kafka so
+// decision-service can make the durable, authoritative call.
 //
-// This is deliberately NOT the authoritative decision. Per the Phase 1
-// design decision, Postgres is the source of truth and Redis here is
-// fast, disposable, derived state. A 200 from POST /items/{id}/checkout
-// means "the fast path admitted this purchase", not "a durable
-// reservation exists" -- there is no reservations row yet, because that
-// requires the Kafka producer (Phase 6) and decision-service consuming
-// it and writing to Postgres. Until then this is intentionally an
-// optimistic, in-memory-speed gate in front of the real thing.
+// A 200 here means "the fast path admitted this purchase and durably
+// recorded the attempt", not "you have a confirmed reservation". Per
+// the Phase 1 design decision, Postgres is the source of truth; the
+// actual reservation only exists once decision-service consumes this
+// event and writes it. This service has no way to report that final
+// outcome back yet -- there's no GET-status endpoint -- so the
+// response is honest about being provisional.
 package main
 
 import (
@@ -21,19 +21,24 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	kafka "github.com/segmentio/kafka-go"
 
 	"github.com/Agam73/flashsale-reservation/internal/config"
 	"github.com/Agam73/flashsale-reservation/internal/httpx"
+	"github.com/Agam73/flashsale-reservation/internal/kafkax"
 	"github.com/Agam73/flashsale-reservation/internal/redisx"
 )
 
 func main() {
 	addr := ":" + config.String("CHECKOUT_API_PORT", "8082")
 	redisAddr := config.String("REDIS_ADDR", "localhost:6379")
+	brokers := strings.Split(config.String("KAFKA_BROKERS", "localhost:9092"), ",")
+	admissionTTL := time.Duration(config.Int("ADMISSION_TTL_SECONDS", 120)) * time.Second
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -44,10 +49,13 @@ func main() {
 	}
 	defer redisClient.Close()
 
-	srv := newServer(addr, redisClient)
+	kafkaWriter := kafkax.NewWriter(brokers)
+	defer kafkaWriter.Close()
+
+	srv := newServer(addr, redisClient, kafkaWriter, admissionTTL)
 
 	go func() {
-		log.Printf("checkout-api listening on %s", addr)
+		log.Printf("checkout-api listening on %s (kafka brokers: %v)", addr, brokers)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("checkout-api: %v", err)
 		}
@@ -64,10 +72,10 @@ func main() {
 	log.Println("checkout-api: stopped")
 }
 
-func newServer(addr string, redisClient *redis.Client) *http.Server {
+func newServer(addr string, redisClient *redis.Client, kafkaWriter *kafka.Writer, admissionTTL time.Duration) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("POST /items/{itemID}/checkout", handleCheckout(redisClient))
+	mux.HandleFunc("POST /items/{itemID}/checkout", handleCheckout(redisClient, kafkaWriter, admissionTTL))
 	mux.HandleFunc("POST /items/{itemID}/inventory", handleSeedInventory(redisClient))
 	mux.HandleFunc("GET /items/{itemID}/inventory", handleGetInventory(redisClient))
 
@@ -90,21 +98,25 @@ type checkoutRequest struct {
 }
 
 type checkoutResponse struct {
-	ItemID    string `json:"item_id"`
-	UserID    string `json:"user_id"`
-	Quantity  int64  `json:"quantity"`
-	Remaining int64  `json:"remaining_inventory"`
-	Status    string `json:"status"`
-	Note      string `json:"note"`
+	ItemID         string `json:"item_id"`
+	UserID         string `json:"user_id"`
+	Quantity       int64  `json:"quantity"`
+	Remaining      int64  `json:"remaining_inventory"`
+	IdempotencyKey string `json:"idempotency_key"`
+	Status         string `json:"status"`
+	Note           string `json:"note"`
 }
 
-// handleCheckout is the fast path: verify the admission token, then
-// atomically decrement inventory. If the decrement fails after the
-// token was already consumed, the token is intentionally not restored
-// -- it's single-use by design, and Phase 6's Kafka retry path is where
-// "the buyer's attempt didn't survive the fast path" gets handled
-// properly rather than by trying to un-consume state here.
-func handleCheckout(redisClient *redis.Client) http.HandlerFunc {
+// handleCheckout: verify the admission token, atomically decrement the
+// Redis fast-path counter, then durably publish the attempt to Kafka.
+//
+// If the Kafka publish fails after the Redis decrement already
+// succeeded, that inventory would otherwise be silently stranded --
+// held in Redis against an attempt nobody will ever authoritatively
+// decide. So on publish failure this releases the Redis inventory back
+// and re-grants the buyer's admission token (same TTL), so they can
+// retry the checkout call without rejoining the waiting room queue.
+func handleCheckout(redisClient *redis.Client, kafkaWriter *kafka.Writer, admissionTTL time.Duration) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		itemID := r.PathValue("itemID")
 		if itemID == "" {
@@ -151,14 +163,50 @@ func handleCheckout(redisClient *redis.Client) http.HandlerFunc {
 			return
 		}
 
+		idempotencyKey, err := kafkax.NewIdempotencyKey()
+		if err != nil {
+			log.Printf("checkout-api: generating idempotency key: %v", err)
+			releaseAndRegrant(r.Context(), redisClient, itemID, req.UserID, req.Quantity, admissionTTL)
+			httpx.WriteError(w, http.StatusInternalServerError, "failed to submit purchase attempt -- try again")
+			return
+		}
+
+		event := kafkax.PurchaseAttempted{
+			ItemID:         itemID,
+			UserID:         req.UserID,
+			Quantity:       req.Quantity,
+			IdempotencyKey: idempotencyKey,
+			AttemptedAt:    time.Now().UTC(),
+		}
+		if err := kafkax.PublishAttempt(r.Context(), kafkaWriter, event); err != nil {
+			log.Printf("checkout-api: publishing attempt for item %s user %s: %v", itemID, req.UserID, err)
+			releaseAndRegrant(r.Context(), redisClient, itemID, req.UserID, req.Quantity, admissionTTL)
+			httpx.WriteError(w, http.StatusServiceUnavailable, "failed to submit purchase attempt -- try again")
+			return
+		}
+
 		httpx.WriteJSON(w, http.StatusOK, checkoutResponse{
-			ItemID:    itemID,
-			UserID:    req.UserID,
-			Quantity:  req.Quantity,
-			Remaining: remaining,
-			Status:    "fast_path_admitted",
-			Note:      "no durable reservation created yet -- Kafka + decision-service land in Phase 6",
+			ItemID:         itemID,
+			UserID:         req.UserID,
+			Quantity:       req.Quantity,
+			Remaining:      remaining,
+			IdempotencyKey: idempotencyKey,
+			Status:         "pending_confirmation",
+			Note:           "fast path admitted and the attempt was durably recorded -- decision-service decides the actual reservation asynchronously; there's no status-check endpoint yet",
 		})
+	}
+}
+
+// releaseAndRegrant undoes the Redis-side effects of an admission that
+// didn't make it all the way to a durable Kafka publish, so a
+// transient Kafka blip doesn't cost the buyer their spot in line or
+// strand inventory that was never actually recorded as attempted.
+func releaseAndRegrant(ctx context.Context, redisClient *redis.Client, itemID, userID string, quantity int64, admissionTTL time.Duration) {
+	if err := redisx.ReleaseInventory(ctx, redisClient, itemID, quantity); err != nil {
+		log.Printf("checkout-api: releasing inventory for item %s after failed publish: %v", itemID, err)
+	}
+	if err := redisx.GrantAdmission(ctx, redisClient, itemID, userID, admissionTTL); err != nil {
+		log.Printf("checkout-api: re-granting admission for item %s user %s after failed publish: %v", itemID, userID, err)
 	}
 }
 
