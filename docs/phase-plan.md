@@ -38,8 +38,16 @@ checkable path through it.
       units of stock. Kafka wire-level behavior (partition routing,
       consumer group rebalancing, end-to-end buyer flow) verified on
       the actual dev machine -- see `docs/phase6.md`.
-- [ ] **Phase 7 -- Worker architecture**
-      expiry-worker as a proper worker-pool pattern.
+- [x] **Phase 7 -- Worker architecture**
+      expiry-worker as a proper worker-pool pattern: one scanner
+      goroutine on a ticker, a fixed pool of worker goroutines draining
+      a shared job channel. Correctness logic
+      (`internal/expiry.ExpireReservation`) verified against real
+      Postgres, including a 50-goroutine concurrency test proving a
+      reservation's inventory is never released twice. Verified end to
+      end by seeding a realistic mix of expired/not-yet-expired/
+      already-completed reservations and running the actual compiled
+      binary against them -- see `docs/phase7.md`.
 - [ ] **Phase 8 -- Reliability & failure handling**
       Idempotency, retries, dead-letter topic. Then deliberately break
       things (kill a consumer mid-batch, stop Postgres, duplicate an
