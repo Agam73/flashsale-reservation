@@ -266,19 +266,16 @@ func TestProcessAttemptExactStockBoundary(t *testing.T) {
 // unreachable through the real buyer flow today -- but ProcessAttempt
 // has no guard of its own, and a Kafka message doesn't know or enforce
 // that its producer validated anything.
-func TestProcessAttemptZeroQuantityIsAcceptedAsReserved(t *testing.T) {
+func TestProcessAttemptRejectsZeroQuantity(t *testing.T) {
 	ctx := context.Background()
 	db := testDB(t)
 	itemID := seedItem(t, db, 5)
 
-	outcome, err := ProcessAttempt(ctx, db, Attempt{
+	_, err := ProcessAttempt(ctx, db, Attempt{
 		ItemID: itemID, UserID: "alice", Quantity: 0, IdempotencyKey: "attempt-1",
 	}, testTTL)
-	if err != nil {
-		t.Fatalf("ProcessAttempt: %v", err)
-	}
-	if outcome.Status != "reserved" {
-		t.Errorf("current behavior: zero-quantity attempts are accepted as 'reserved' with no inventory effect -- got %q, behavior may have changed", outcome.Status)
+	if !errors.Is(err, ErrInvalidQuantity) {
+		t.Errorf("expected ErrInvalidQuantity for a zero-quantity attempt, got %v", err)
 	}
 
 	var available int
@@ -286,7 +283,7 @@ func TestProcessAttemptZeroQuantityIsAcceptedAsReserved(t *testing.T) {
 		t.Fatalf("reading inventory: %v", err)
 	}
 	if available != 5 {
-		t.Errorf("expected inventory unchanged at 5 for a zero-quantity attempt, got %d", available)
+		t.Errorf("expected inventory unchanged at 5 for a rejected zero-quantity attempt, got %d", available)
 	}
 }
 
@@ -302,26 +299,23 @@ func TestProcessAttemptZeroQuantityIsAcceptedAsReserved(t *testing.T) {
 // adding `if attempt.Quantity <= 0 { return Outcome{}, fmt.Errorf(...) }`
 // directly in ProcessAttempt as part of Phase 8 hardening, so this
 // invariant doesn't live solely in the HTTP layer.
-func TestProcessAttemptNegativeQuantityIncreasesInventory(t *testing.T) {
+func TestProcessAttemptRejectsNegativeQuantity(t *testing.T) {
 	ctx := context.Background()
 	db := testDB(t)
 	itemID := seedItem(t, db, 5)
 
-	outcome, err := ProcessAttempt(ctx, db, Attempt{
+	_, err := ProcessAttempt(ctx, db, Attempt{
 		ItemID: itemID, UserID: "alice", Quantity: -10, IdempotencyKey: "attempt-1",
 	}, testTTL)
-	if err != nil {
-		t.Fatalf("ProcessAttempt: %v", err)
-	}
-	if outcome.Status != "reserved" {
-		t.Fatalf("expected current (unvalidated) behavior to reserve a negative-quantity attempt, got %q", outcome.Status)
+	if !errors.Is(err, ErrInvalidQuantity) {
+		t.Fatalf("expected ErrInvalidQuantity, got %v", err)
 	}
 
 	var available int
 	if err := db.QueryRow(`SELECT available_inventory FROM items WHERE id = $1`, itemID).Scan(&available); err != nil {
 		t.Fatalf("reading inventory: %v", err)
 	}
-	if available != 15 {
-		t.Errorf("expected the documented gap (5 - (-10) = 15), got %d -- if ProcessAttempt now validates quantity, update or remove this test", available)
+	if available != 5 {
+		t.Errorf("expected inventory untouched at 5 after a rejected negative-quantity attempt, got %d", available)
 	}
 }

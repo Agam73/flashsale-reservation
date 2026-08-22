@@ -24,6 +24,16 @@ import (
 // non-retryable error rather than a "rejected" outcome.
 var ErrItemNotFound = errors.New("decision: item not found")
 
+// ErrInvalidQuantity means the attempt requested zero or a negative
+// quantity. checkout-api's HTTP handler already rejects this at the
+// edge, but ProcessAttempt is what Kafka messages actually reach, and
+// nothing guarantees every producer is checkout-api forever -- without
+// this guard, a negative quantity would make
+// "available_inventory - quantity" increase stock instead of
+// decrementing it. Validated here, not just at the HTTP layer, because
+// this is the function that's supposed to be authoritative.
+var ErrInvalidQuantity = errors.New("decision: quantity must be positive")
+
 // Attempt is what a PurchaseAttempted Kafka message decodes into.
 // IdempotencyKey is what makes reprocessing the same message (Kafka's
 // at-least-once guarantee) safe: the same key always produces the same
@@ -52,6 +62,9 @@ type Outcome struct {
 // ProcessAttempt is the entire "prevent overselling for real" story in
 // one function. It:
 //
+//  0. Rejects a non-positive quantity outright (ErrInvalidQuantity),
+//     before opening a transaction at all -- a negative quantity would
+//     otherwise make step 4's decrement increase inventory instead.
 //  1. Locks the item's row (SELECT ... FOR UPDATE) for the duration of
 //     the transaction. Kafka's partition-by-item-ID design already
 //     ensures one consumer processes a given item's attempts at a
@@ -72,6 +85,10 @@ type Outcome struct {
 // All of this happens in one transaction, so a crash between steps
 // leaves nothing half-applied.
 func ProcessAttempt(ctx context.Context, db *sql.DB, attempt Attempt, reservationTTL time.Duration) (Outcome, error) {
+	if attempt.Quantity <= 0 {
+		return Outcome{}, fmt.Errorf("%w: got %d", ErrInvalidQuantity, attempt.Quantity)
+	}
+
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return Outcome{}, fmt.Errorf("decision: beginning transaction: %w", err)
