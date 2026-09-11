@@ -65,12 +65,22 @@ type Outcome struct {
 //  0. Rejects a non-positive quantity outright (ErrInvalidQuantity),
 //     before opening a transaction at all -- a negative quantity would
 //     otherwise make step 4's decrement increase inventory instead.
-//  1. Locks the item's row (SELECT ... FOR UPDATE) for the duration of
-//     the transaction. Kafka's partition-by-item-ID design already
-//     ensures one consumer processes a given item's attempts at a
-//     time; this lock is the belt-and-suspenders backstop that holds
-//     even if that invariant is ever violated (e.g. two decision-service
-//     replicas briefly overlapping during a rebalance).
+//  1. Locks the item's row (SELECT ... FOR NO KEY UPDATE) for the
+//     duration of the transaction. Kafka's partition-by-item-ID design
+//     already ensures one consumer processes a given item's attempts
+//     at a time; this lock is the belt-and-suspenders backstop that
+//     holds even if that invariant is ever violated (e.g. two
+//     decision-service replicas briefly overlapping during a
+//     rebalance). FOR NO KEY UPDATE, not the stronger FOR UPDATE: we
+//     never modify the row's key (its id), only available_inventory,
+//     and FOR NO KEY UPDATE is compatible with the FOR KEY SHARE lock
+//     Postgres implicitly takes on this same row for every INSERT INTO
+//     reservations (its FK check on item_id). Under high concurrency
+//     on one hot item -- exactly what a flash sale's hottest item looks
+//     like -- FOR UPDATE's incompatibility with FOR KEY SHARE is a
+//     documented way to trigger real Postgres deadlocks; FOR NO KEY
+//     UPDATE avoids that class of conflict entirely rather than just
+//     making it less likely.
 //  2. Decides reserved vs rejected based on the locked row's current
 //     available_inventory.
 //  3. Inserts the reservation with ON CONFLICT (item_id,
@@ -97,7 +107,7 @@ func ProcessAttempt(ctx context.Context, db *sql.DB, attempt Attempt, reservatio
 
 	var available int64
 	err = tx.QueryRowContext(ctx,
-		`SELECT available_inventory FROM items WHERE id = $1 FOR UPDATE`,
+		`SELECT available_inventory FROM items WHERE id = $1 FOR NO KEY UPDATE`,
 		attempt.ItemID,
 	).Scan(&available)
 	if errors.Is(err, sql.ErrNoRows) {

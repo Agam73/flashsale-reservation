@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	kafka "github.com/segmentio/kafka-go"
 )
@@ -17,13 +18,27 @@ import (
 // explicitly setting this, every PurchaseAttempted event would scatter
 // across partitions regardless of item ID, and decision-service's
 // one-consumer-per-item guarantee would quietly stop holding.
+//
+// MaxAttempts/WriteBackoffMin/WriteBackoffMax (Phase 8) are set
+// explicitly rather than left as kafka-go's defaults, so a transient
+// produce failure -- a leader election in progress, a momentary
+// network blip -- gets retried by the library itself a handful of
+// times with backoff before WriteMessages ever returns an error to the
+// caller. This is the producer-side half of this phase's reliability
+// story; the consumer-side half (decision-service's retry/DLQ logic in
+// internal/retry and internal/kafkax/dlq.go) is separate, because a
+// failed *consume* can mean something is wrong with the specific
+// message, which a failed *produce* essentially never does.
 func NewWriter(brokers []string) *kafka.Writer {
 	return &kafka.Writer{
-		Addr:         kafka.TCP(brokers...),
-		Topic:        CheckoutAttemptsTopic,
-		Balancer:     &kafka.Hash{},
-		RequiredAcks: kafka.RequireOne,
-		Async:        false,
+		Addr:            kafka.TCP(brokers...),
+		Topic:           CheckoutAttemptsTopic,
+		Balancer:        &kafka.Hash{},
+		RequiredAcks:    kafka.RequireOne,
+		Async:           false,
+		MaxAttempts:     5,
+		WriteBackoffMin: 100 * time.Millisecond,
+		WriteBackoffMax: 2 * time.Second,
 	}
 }
 

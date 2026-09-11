@@ -93,9 +93,13 @@ retried payment confirmations (e.g. a webhook firing twice), the same
 - `available_inventory` is a plain column, not a version/optimistic-lock
   counter. Because exactly one consumer instance ever decides a given
   item's outcome at a time (item-ID partition key), a simple
-  `SELECT ... FOR UPDATE` inside decision-service's transaction is
-  enough to serialize writes — no optimistic-concurrency dance needed
-  at the schema level.
+  `SELECT ... FOR NO KEY UPDATE` inside decision-service's transaction
+  is enough to serialize writes — no optimistic-concurrency dance
+  needed at the schema level. (Originally written as `FOR UPDATE`;
+  changed in Phase 8 after real concurrent load surfaced Postgres
+  deadlocks between that lock and the `FOR KEY SHARE` lock every
+  `INSERT INTO reservations` implicitly takes via its `item_id` foreign
+  key — see `docs/phase8.md`.)
 
 ## Verifying it
 

@@ -52,6 +52,17 @@ checkable path through it.
       Idempotency, retries, dead-letter topic. Then deliberately break
       things (kill a consumer mid-batch, stop Postgres, duplicate an
       event) and confirm the system recovers the way it's supposed to.
+      Idempotency was already built (Phase 6/7); this phase closed a
+      real gap in the existing retry policy -- an extended Postgres
+      outage would have dead-lettered every in-flight message, not just
+      genuinely bad ones. `classifyOutcome` distinguishes infra failures
+      (retry forever, uncounted) from data failures (dead-letter
+      promptly) from unknown Postgres errors (bounded by the existing
+      `retry.Policy`). The classification logic itself is unit-tested
+      (8 tests, no broker needed); the actual chaos-testing exercises
+      (kill mid-batch, stop Postgres, duplicate an event) still need to
+      be run against the real stack -- not yet done by anyone. See
+      `docs/phase8.md`.
 - [ ] **Phase 9 -- Redis**
       Atomic inventory counters, waiting-room queue state, risk-score
       cache.
