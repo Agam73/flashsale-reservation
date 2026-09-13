@@ -7,9 +7,15 @@
 // check. That handoff is what makes the waiting room's fairness rule
 // actually enforced rather than advisory.
 //
-// No Kafka, no Postgres here yet: this service only ever touches
-// Redis. Phase 6 adds the durable, authoritative path through
-// decision-service.
+// Phase 9 adds queue-depth caching (see handleQueueDepth). Phase 10
+// adds this service's first Kafka dependency: every buyer admitted
+// off the queue also gets a BuyerJoined event published to
+// kafkax.WaitingRoomJoinsTopic, which risk-service consumes to score
+// bot/scalper risk asynchronously. Publishing happens in a background
+// goroutine, off the request path entirely -- per the Phase 1 design
+// decision that risk scoring must never be able to slow down or block
+// admission, a slow or unreachable Kafka broker cannot make a buyer
+// wait any longer than they already were.
 package main
 
 import (
@@ -20,14 +26,18 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	kafka "github.com/segmentio/kafka-go"
 
 	"github.com/Agam73/flashsale-reservation/internal/admission"
 	"github.com/Agam73/flashsale-reservation/internal/config"
 	"github.com/Agam73/flashsale-reservation/internal/httpx"
+	"github.com/Agam73/flashsale-reservation/internal/kafkax"
 	"github.com/Agam73/flashsale-reservation/internal/redisx"
 )
 
@@ -36,6 +46,7 @@ func main() {
 	redisAddr := config.String("REDIS_ADDR", "localhost:6379")
 	ratePerSecond := config.Int("ADMIT_RATE_PER_SEC", 5)
 	admissionTTL := time.Duration(config.Int("ADMISSION_TTL_SECONDS", 120)) * time.Second
+	brokers := strings.Split(config.String("KAFKA_BROKERS", "localhost:9092"), ",")
 
 	// ctx is the service's own lifetime: cancelled on SIGINT/SIGTERM,
 	// which in turn stops every Admitter the registry owns, since they
@@ -49,11 +60,19 @@ func main() {
 	}
 	defer redisClient.Close()
 
+	kafkaWriter := kafkax.NewWaitingRoomWriter(brokers)
+	defer kafkaWriter.Close()
+
+	// Tracks in-flight BuyerJoined publishes so shutdown can wait for
+	// them to finish (or hit their own timeout) before closing the
+	// writer out from under them -- see handleJoin.
+	var publishWG sync.WaitGroup
+
 	registry := admission.NewRegistry(ctx, ratePerSecond)
-	srv := newServer(addr, registry, redisClient, admissionTTL)
+	srv := newServer(addr, registry, redisClient, kafkaWriter, &publishWG, admissionTTL)
 
 	go func() {
-		log.Printf("waiting-room-api listening on %s (admit rate: %d/sec/item, admission ttl: %s)", addr, ratePerSecond, admissionTTL)
+		log.Printf("waiting-room-api listening on %s (admit rate: %d/sec/item, admission ttl: %s, kafka brokers: %v)", addr, ratePerSecond, admissionTTL, brokers)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("waiting-room-api: %v", err)
 		}
@@ -74,13 +93,18 @@ func main() {
 	// Every Admitter's loop is already watching ctx (cancelled above);
 	// this just blocks until they've actually finished exiting.
 	registry.Shutdown()
+
+	// Let any BuyerJoined publishes still in flight finish (each has
+	// its own bounded timeout, see handleJoin) before the writer they
+	// depend on gets closed by the deferred kafkaWriter.Close() above.
+	publishWG.Wait()
 	log.Println("waiting-room-api: stopped")
 }
 
-func newServer(addr string, registry *admission.Registry, redisClient *redis.Client, admissionTTL time.Duration) *http.Server {
+func newServer(addr string, registry *admission.Registry, redisClient *redis.Client, kafkaWriter *kafka.Writer, publishWG *sync.WaitGroup, admissionTTL time.Duration) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("POST /items/{itemID}/join", handleJoin(registry, redisClient, admissionTTL))
+	mux.HandleFunc("POST /items/{itemID}/join", handleJoin(registry, redisClient, kafkaWriter, publishWG, admissionTTL))
 	mux.HandleFunc("GET /items/{itemID}/queue", handleQueueDepth(registry, redisClient))
 
 	return &http.Server{
@@ -114,7 +138,7 @@ type joinResponse struct {
 // handleJoin blocks until the caller is admitted or their connection
 // drops -- the HTTP request itself is the wait, so there's no separate
 // "check my position" endpoint to keep in sync with it.
-func handleJoin(registry *admission.Registry, redisClient *redis.Client, admissionTTL time.Duration) http.HandlerFunc {
+func handleJoin(registry *admission.Registry, redisClient *redis.Client, kafkaWriter *kafka.Writer, publishWG *sync.WaitGroup, admissionTTL time.Duration) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		itemID := r.PathValue("itemID")
 		if itemID == "" {
@@ -147,6 +171,26 @@ func handleJoin(registry *admission.Registry, redisClient *redis.Client, admissi
 			httpx.WriteError(w, http.StatusInternalServerError, "admitted, but failed to issue a checkout token -- try again")
 			return
 		}
+
+		// Tell risk-service this buyer made it off the queue. Fired
+		// off the request path: publishWG lets shutdown wait for it,
+		// but nothing about this response depends on it succeeding --
+		// see this file's package doc for why.
+		event := kafkax.BuyerJoined{
+			ItemID:     itemID,
+			UserID:     req.UserID,
+			RemoteAddr: r.RemoteAddr,
+			JoinedAt:   time.Now().UTC(),
+		}
+		publishWG.Add(1)
+		go func() {
+			defer publishWG.Done()
+			publishCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := kafkax.PublishBuyerJoined(publishCtx, kafkaWriter, event); err != nil {
+				log.Printf("waiting-room-api: publishing buyer-joined event for item %s user %s: %v", itemID, req.UserID, err)
+			}
+		}()
 
 		httpx.WriteJSON(w, http.StatusOK, joinResponse{
 			ItemID:              itemID,

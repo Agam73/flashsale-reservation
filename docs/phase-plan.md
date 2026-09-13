@@ -81,9 +81,28 @@ checkable path through it.
       the write/read surface Phase 10's risk-service needs; nothing
       calls it yet. All new logic verified directly against real
       Postgres and Redis. See `docs/phase9.md`.
-- [ ] **Phase 10 -- FastAPI AI service**
-      risk-service: consumes waiting-room events, scores bot/scalper
-      risk asynchronously, writes to Redis.
+- [x] **Phase 10 -- FastAPI AI service**
+      risk-service consumes waiting-room events, scores bot/scalper
+      risk asynchronously, writes to Redis. This phase's own gap
+      surfaced immediately: "waiting-room events" didn't exist yet --
+      waiting-room-api had never published anything to Kafka. Added
+      that first: a `BuyerJoined` event (`internal/kafkax`) published
+      from a background goroutine after a buyer is actually admitted,
+      never on the request path, so a slow/unreachable Kafka broker
+      can't add latency to admission (verified directly: admission
+      still returns in ~0.1s with the broker pointed at a closed
+      port). risk-service (Python/FastAPI) consumes that topic, tracks
+      two sliding-window signals per event in Redis (join velocity per
+      user, distinct users per IP) via `risk_window.py`, and combines
+      them into a score via `scoring.py` -- a documented heuristic, not
+      a trained model, since there's no labeled data in this project
+      to train one on. Scores land in the same `risk:{item}:{user}`
+      Redis key Phase 9 defined, wire-compatible in both directions
+      (verified with a real Go-marshaled event parsed and processed by
+      the Python side end to end). Nothing consumes a score to change
+      a decision yet -- per the Phase 1 design decision, that would
+      require calling into this from checkout-api's hot path, which
+      is explicitly out of bounds. See `docs/phase10.md`.
 - [ ] **Phase 11 -- Observability**
       Structured logs, Prometheus metrics, Grafana dashboards,
       OpenTelemetry traces, correlation IDs across every service.

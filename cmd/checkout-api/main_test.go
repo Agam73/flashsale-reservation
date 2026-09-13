@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -17,6 +18,21 @@ import (
 	"github.com/Agam73/flashsale-reservation/internal/kafkax"
 	"github.com/Agam73/flashsale-reservation/internal/redisx"
 )
+
+// requireKafka skips the test if no broker answers at addr within a
+// short timeout, instead of letting a real produce/consume call hang
+// or fail with a confusing error. Mirrors testRedis/testDB's
+// skip-cleanly-if-unavailable philosophy, applied to the one test in
+// this file that actually needs a live broker rather than just
+// constructing a Writer it never calls WriteMessages on.
+func requireKafka(t *testing.T, addr string) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Skipf("skipping: no local Kafka available at %s: %v", addr, err)
+	}
+	conn.Close()
+}
 
 // testDB connects to the same Postgres instance the rest of this
 // project's tests target, same skip-cleanly-if-unavailable pattern as
@@ -206,6 +222,7 @@ func TestHandleCheckout_SoldOut(t *testing.T) {
 // testing. Fine locally; would need rethinking against a topic with
 // serious message volume.
 func TestHandleCheckout_SuccessPublishesToKafka(t *testing.T) {
+	requireKafka(t, "localhost:9092")
 	redisClient := testRedis(t)
 	writerForCheckout := kafkax.NewWriter([]string{"localhost:9092"})
 	defer writerForCheckout.Close()
