@@ -69,7 +69,9 @@ decrement 1 unit of stock, exactly 1 succeeds (see
 are dev/test-only endpoints to seed and read the Redis counter directly
 -- there's no Postgres wiring in this phase to seed it from, so
 something has to. Phase 9 replaces this with real seeding and
-reconciliation from `items.available_inventory`.
+reconciliation from `items.available_inventory`. (Done -- the manual
+seed endpoint is gone as of Phase 9; see `docs/phase9.md`. The
+read-only `GET .../inventory` endpoint is unaffected.)
 
 ## What a 200 from checkout does *not* mean
 
@@ -103,7 +105,7 @@ decision-service consuming it into Postgres.
   `ADMIT_RATE_PER_SEC`. Per-item rates need a reason to talk to
   Postgres, which this phase doesn't have.
 - Inventory is seeded manually via `POST /items/{id}/inventory`
-  instead of from Postgres. Phase 9.
+  instead of from Postgres. Phase 9. (Done -- see `docs/phase9.md`.)
 - No graceful "still waiting, retry" response for buyers who've been in
   line a long time -- `/join` blocks unbounded (bounded only by the
   client's own timeout). Revisit if it becomes a real problem once load

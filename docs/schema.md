@@ -8,8 +8,9 @@ Phase 1.
 
 The thing being sold. `available_inventory` is the number that
 actually matters, and it's **authoritative in Postgres** — per the
-Phase 1 decision, Redis (Phase 9) only ever holds a fast, disposable
-copy of this value that can be rebuilt from this row if it's lost.
+Phase 1 decision, Redis (Phase 9 — done, see `docs/phase9.md`) only
+ever holds a fast, disposable copy of this value that can be rebuilt
+from this row if it's lost.
 
 ```
 available_inventory <= total_inventory   (CHECK)

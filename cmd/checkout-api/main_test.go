@@ -3,18 +3,53 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	kafka "github.com/segmentio/kafka-go"
 
 	"github.com/Agam73/flashsale-reservation/internal/kafkax"
 	"github.com/Agam73/flashsale-reservation/internal/redisx"
 )
+
+// testDB connects to the same Postgres instance the rest of this
+// project's tests target, same skip-cleanly-if-unavailable pattern as
+// testRedis below.
+func testDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("postgres", "postgres://flashsale:flashsale@localhost:5432/flashsale?sslmode=disable")
+	if err != nil {
+		t.Skipf("skipping: no local Postgres available: %v", err)
+	}
+	if err := db.Ping(); err != nil {
+		t.Skipf("skipping: no local Postgres available: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+// seedPGItem inserts an on-sale item with the given available
+// inventory directly into Postgres and returns its ID.
+func seedPGItem(t *testing.T, db *sql.DB, available int64) string {
+	t.Helper()
+	var id string
+	err := db.QueryRow(`
+		INSERT INTO items (name, price_cents, total_inventory, available_inventory, status)
+		VALUES ('Test Item', 1000, $1, $1, 'on_sale')
+		RETURNING id
+	`, available).Scan(&id)
+	if err != nil {
+		t.Fatalf("seeding postgres item: %v", err)
+	}
+	t.Cleanup(func() { db.Exec(`DELETE FROM items WHERE id = $1`, id) })
+	return id
+}
 
 const testAdmissionTTL = 2 * time.Minute
 
@@ -243,5 +278,102 @@ func TestHandleCheckout_SuccessPublishesToKafka(t *testing.T) {
 	}
 	if string(foundKey) != itemID {
 		t.Errorf("expected message key=%q (item ID, for partitioning), got %q", itemID, string(foundKey))
+	}
+}
+
+// --- Phase 9: reconciliation endpoint. Requires live Postgres + Redis. ---
+
+func doReconcile(t *testing.T, db *sql.DB, redisClient *redis.Client, itemID string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest("POST", "/items/"+itemID+"/reconcile", nil)
+	req.SetPathValue("itemID", itemID)
+	rec := httptest.NewRecorder()
+	handleReconcileItem(db, redisClient)(rec, req)
+	return rec
+}
+
+// TestHandleReconcileItem_SeedsRedisFromPostgres is the end-to-end
+// check for this phase's actual new behavior: an item that only exists
+// in Postgres, with no Redis counter at all yet, becomes checkout-able
+// after a single call to this endpoint.
+func TestHandleReconcileItem_SeedsRedisFromPostgres(t *testing.T) {
+	db := testDB(t)
+	redisClient := testRedis(t)
+
+	itemID := seedPGItem(t, db, 6)
+
+	if _, err := redisx.GetInventory(context.Background(), redisClient, itemID); err == nil {
+		t.Fatal("expected no redis inventory to exist before reconciling")
+	}
+
+	rec := doReconcile(t, db, redisClient, itemID)
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if resp["available"].(float64) != 6 {
+		t.Errorf("expected available=6 in response, got %v", resp["available"])
+	}
+
+	n, err := redisx.GetInventory(context.Background(), redisClient, itemID)
+	if err != nil {
+		t.Fatalf("GetInventory after reconcile: %v", err)
+	}
+	if n != 6 {
+		t.Errorf("expected redis seeded to 6, got %d", n)
+	}
+}
+
+// TestHandleReconcileItem_OverwritesDriftedRedisValue checks the drift-
+// correction case: Redis already has a (wrong) value, and reconciling
+// forces it back to whatever Postgres currently says.
+func TestHandleReconcileItem_OverwritesDriftedRedisValue(t *testing.T) {
+	db := testDB(t)
+	redisClient := testRedis(t)
+
+	itemID := seedPGItem(t, db, 20)
+	if err := redisx.SeedInventory(context.Background(), redisClient, itemID, 999); err != nil {
+		t.Fatalf("seeding stale redis value: %v", err)
+	}
+
+	rec := doReconcile(t, db, redisClient, itemID)
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	n, err := redisx.GetInventory(context.Background(), redisClient, itemID)
+	if err != nil {
+		t.Fatalf("GetInventory after reconcile: %v", err)
+	}
+	if n != 20 {
+		t.Errorf("expected postgres's value 20 to win over the stale 999, got %d", n)
+	}
+}
+
+func TestHandleReconcileItem_UnknownItemReturns404(t *testing.T) {
+	db := testDB(t)
+	redisClient := testRedis(t)
+
+	rec := doReconcile(t, db, redisClient, "00000000-0000-0000-0000-000000000000")
+	if rec.Code != 404 {
+		t.Errorf("expected 404 for an unknown item, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleReconcileItem_MissingItemID(t *testing.T) {
+	db := testDB(t)
+	redisClient := testRedis(t)
+
+	req := httptest.NewRequest("POST", "/items//reconcile", nil)
+	req.SetPathValue("itemID", "")
+	rec := httptest.NewRecorder()
+	handleReconcileItem(db, redisClient)(rec, req)
+
+	if rec.Code != 400 {
+		t.Errorf("expected 400 for missing item id, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

@@ -36,10 +36,11 @@ end
 return redis.call('DECRBY', KEYS[1], qty)
 `)
 
-// SeedInventory sets the fast-path available count for an item. This is
-// a Phase 4 stand-in for real seeding from Postgres -- Phase 9 is where
-// this gets wired up properly and made rebuildable from
-// items.available_inventory if Redis state is ever lost.
+// SeedInventory sets the fast-path available count for an item. Phase 4
+// called this directly from a dev-only HTTP endpoint as a stand-in for
+// real seeding; Phase 9's internal/reconcile package is what calls it
+// for real now, from items.available_inventory, so Redis state is
+// always rebuildable if it's ever lost.
 func SeedInventory(ctx context.Context, client *redis.Client, itemID string, available int64) error {
 	if available < 0 {
 		return fmt.Errorf("redisx: cannot seed negative inventory (%d) for item %s", available, itemID)

@@ -81,6 +81,7 @@ func newServer(addr string, registry *admission.Registry, redisClient *redis.Cli
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.HandleFunc("POST /items/{itemID}/join", handleJoin(registry, redisClient, admissionTTL))
+	mux.HandleFunc("GET /items/{itemID}/queue", handleQueueDepth(registry, redisClient))
 
 	return &http.Server{
 		Addr:        addr,
@@ -154,5 +155,50 @@ func handleJoin(registry *admission.Registry, redisClient *redis.Client, admissi
 			Status:              "admitted",
 			AdmissionTTLSeconds: int(admissionTTL.Seconds()),
 		})
+	}
+}
+
+type queueDepthResponse struct {
+	ItemID  string `json:"item_id"`
+	Waiting int    `json:"waiting"`
+}
+
+// handleQueueDepth answers "how many buyers are currently waiting for
+// this item" -- Phase 9's "waiting-room queue state" piece. The
+// in-memory Admitter (Phase 2) remains the actual source of truth; this
+// just reads its current depth and also publishes it into Redis
+// (redisx.SetQueueDepth) so the number is visible to anything that
+// isn't this specific waiting-room-api instance, without that caller
+// needing its own admission.Registry.
+//
+// Known simplification: if this service restarts, the in-memory queue
+// (and therefore this number) resets to zero even though buyers who
+// were waiting haven't actually been admitted anywhere else -- the
+// same restart behavior the Admitter has always had, just now visible
+// through Redis too. Running more than one waiting-room-api instance
+// per item isn't supported yet either; each instance still owns its
+// own independent queue (see internal/admission/registry.go).
+func handleQueueDepth(registry *admission.Registry, redisClient *redis.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		itemID := r.PathValue("itemID")
+		if itemID == "" {
+			httpx.WriteError(w, http.StatusBadRequest, "item id is required")
+			return
+		}
+
+		depth, err := registry.For(itemID).Depth(r.Context())
+		if err != nil {
+			log.Printf("waiting-room-api: reading queue depth for item %s: %v", itemID, err)
+			httpx.WriteError(w, http.StatusInternalServerError, "failed to read queue depth")
+			return
+		}
+
+		if err := redisx.SetQueueDepth(r.Context(), redisClient, itemID, int64(depth)); err != nil {
+			// Non-fatal: the caller still gets an accurate answer
+			// straight from the Admitter. Redis is just a cache of it.
+			log.Printf("waiting-room-api: caching queue depth for item %s: %v", itemID, err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, queueDepthResponse{ItemID: itemID, Waiting: depth})
 	}
 }

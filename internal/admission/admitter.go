@@ -8,8 +8,14 @@ package admission
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// errStopped is returned by Depth if the admitter's loop has already
+// exited (ctx was cancelled) by the time a depth request would be sent
+// -- there's nobody left to answer it.
+var errStopped = errors.New("admission: admitter has stopped")
 
 // joinRequest is what a caller sends to the admitter's loop when it wants
 // to join the line.
@@ -18,10 +24,22 @@ type joinRequest struct {
 	admitted chan struct{} // loop closes this when the request is admitted
 }
 
+// depthRequest is what a caller sends to the admitter's loop to ask how
+// many buyers are currently waiting. Separate from joinRequest because
+// it's a read-only snapshot, not an attempt to join -- Phase 9 adds
+// this so waiting-room-api can publish queue depth into Redis (fast,
+// disposable, derived state, same relationship Postgres/Redis has
+// elsewhere in this project -- here the Admitter's own queue plays
+// Postgres's role, and Redis just caches a number read from it).
+type depthRequest struct {
+	result chan int
+}
+
 // Admitter admits buyers into the sale at a fixed rate, first come,
 // first served.
 type Admitter struct {
 	requests chan joinRequest
+	depths   chan depthRequest
 	rate     time.Duration
 	done     chan struct{} // closed once the loop has exited
 }
@@ -32,6 +50,7 @@ type Admitter struct {
 func NewAdmitter(ctx context.Context, ratePerSecond int) *Admitter {
 	a := &Admitter{
 		requests: make(chan joinRequest),
+		depths:   make(chan depthRequest),
 		rate:     time.Second / time.Duration(ratePerSecond),
 		done:     make(chan struct{}),
 	}
@@ -71,6 +90,30 @@ func (a *Admitter) Join(ctx context.Context) (position int, admitted <-chan stru
 	}
 }
 
+// Depth returns the number of buyers currently waiting (already
+// joined, not yet admitted). Unlike Join, it never blocks on
+// admission -- it's a snapshot read of the loop's own queue length,
+// answered by the one goroutine that's allowed to touch the queue, so
+// it's always consistent with what Join/run actually see.
+func (a *Admitter) Depth(ctx context.Context) (int, error) {
+	req := depthRequest{result: make(chan int, 1)}
+
+	select {
+	case a.depths <- req:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-a.done:
+		return 0, errStopped
+	}
+
+	select {
+	case n := <-req.result:
+		return n, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
 // run is the admitter's single owning goroutine. It is the only code in
 // this package that ever touches the queue -- that's what makes it safe
 // without a mutex. It holds a FIFO queue, admits the front of the queue
@@ -103,6 +146,9 @@ func (a *Admitter) run(ctx context.Context) {
 				queue = queue[1:]
 				close(next.admitted)
 			}
+
+		case req := <-a.depths:
+			req.result <- len(queue)
 
 		case <-ctx.Done():
 			return

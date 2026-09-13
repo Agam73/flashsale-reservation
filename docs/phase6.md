@@ -159,7 +159,10 @@ still clean.
   since only the Postgres path has the row lock). This is expected and
   matches the Phase 1 design: Redis is optimistic, Postgres is
   authoritative. Reconciling the two -- and what a false-positive
-  fast-path admission means for the buyer -- is Phase 9's job.
+  fast-path admission means for the buyer -- is Phase 9's job. (Done --
+  `internal/reconcile` bounds how long the drift can persist; the
+  buyer-facing answer turned out to be "unchanged, because it doesn't
+  need to change" -- see `docs/phase9.md`.)
 
 ## Testing this phase
 

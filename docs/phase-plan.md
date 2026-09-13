@@ -48,7 +48,7 @@ checkable path through it.
       end by seeding a realistic mix of expired/not-yet-expired/
       already-completed reservations and running the actual compiled
       binary against them -- see `docs/phase7.md`.
-- [ ] **Phase 8 -- Reliability & failure handling**
+- [x] **Phase 8 -- Reliability & failure handling**
       Idempotency, retries, dead-letter topic. Then deliberately break
       things (kill a consumer mid-batch, stop Postgres, duplicate an
       event) and confirm the system recovers the way it's supposed to.
@@ -63,9 +63,24 @@ checkable path through it.
       (kill mid-batch, stop Postgres, duplicate an event) still need to
       be run against the real stack -- not yet done by anyone. See
       `docs/phase8.md`.
-- [ ] **Phase 9 -- Redis**
-      Atomic inventory counters, waiting-room queue state, risk-score
-      cache.
+- [x] **Phase 9 -- Redis**
+      internal/reconcile replaces Phase 4's dev-only manual seed
+      endpoint with the real thing: on startup, and then every
+      `INVENTORY_RECONCILE_INTERVAL_SECONDS`, checkout-api reads every
+      on-sale/scheduled item's authoritative `available_inventory` from
+      Postgres and overwrites Redis's fast-path copy to match --
+      Postgres always wins, no merge logic. A new
+      `POST /items/{id}/reconcile` endpoint does the same thing
+      on-demand for one item. Waiting-room queue state: the in-memory
+      Admitter (Phase 2) gained a non-blocking `Depth` query, and
+      waiting-room-api's new `GET /items/{id}/queue` endpoint publishes
+      that number into Redis (`redisx.SetQueueDepth`) so it's visible
+      without a caller needing its own Admitter -- the Admitter stays
+      the actual source of truth, Redis just caches a number read from
+      it. Risk-score cache: `redisx.SetRiskScore`/`GetRiskScore` build
+      the write/read surface Phase 10's risk-service needs; nothing
+      calls it yet. All new logic verified directly against real
+      Postgres and Redis. See `docs/phase9.md`.
 - [ ] **Phase 10 -- FastAPI AI service**
       risk-service: consumes waiting-room events, scores bot/scalper
       risk asynchronously, writes to Redis.

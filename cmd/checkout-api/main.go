@@ -11,10 +11,17 @@
 // event and writes it. This service has no way to report that final
 // outcome back yet -- there's no GET-status endpoint -- so the
 // response is honest about being provisional.
+//
+// Phase 9 adds this service's first Postgres dependency: on startup,
+// and then on a schedule, internal/reconcile reads every on-sale/
+// scheduled item's authoritative available_inventory and (re)seeds
+// Redis's fast-path copy from it, replacing the dev-only manual seed
+// endpoint Phase 4 shipped as a stand-in (see docs/phase9.md).
 package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"log"
@@ -31,14 +38,18 @@ import (
 	"github.com/Agam73/flashsale-reservation/internal/config"
 	"github.com/Agam73/flashsale-reservation/internal/httpx"
 	"github.com/Agam73/flashsale-reservation/internal/kafkax"
+	"github.com/Agam73/flashsale-reservation/internal/pgdb"
+	"github.com/Agam73/flashsale-reservation/internal/reconcile"
 	"github.com/Agam73/flashsale-reservation/internal/redisx"
 )
 
 func main() {
 	addr := ":" + config.String("CHECKOUT_API_PORT", "8082")
 	redisAddr := config.String("REDIS_ADDR", "localhost:6379")
+	dsn := config.String("DATABASE_URL", "postgres://flashsale:flashsale@localhost:5432/flashsale?sslmode=disable")
 	brokers := strings.Split(config.String("KAFKA_BROKERS", "localhost:9092"), ",")
 	admissionTTL := time.Duration(config.Int("ADMISSION_TTL_SECONDS", 120)) * time.Second
+	reconcileInterval := time.Duration(config.Int("INVENTORY_RECONCILE_INTERVAL_SECONDS", 30)) * time.Second
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -49,13 +60,30 @@ func main() {
 	}
 	defer redisClient.Close()
 
+	db, err := pgdb.New(ctx, pgdb.Config{DSN: dsn})
+	if err != nil {
+		log.Fatalf("checkout-api: %v", err)
+	}
+	defer db.Close()
+
 	kafkaWriter := kafkax.NewWriter(brokers)
 	defer kafkaWriter.Close()
 
-	srv := newServer(addr, redisClient, kafkaWriter, admissionTTL)
+	// Seed Redis from Postgres before accepting any traffic, so the
+	// first buyer after a restart doesn't hit a cold/empty counter and
+	// get a false "item not found or not on sale".
+	log.Println("checkout-api: seeding Redis inventory from Postgres...")
+	reconcileOnce(ctx, db, redisClient)
+
+	// Then keep correcting drift on a schedule for as long as the
+	// service runs -- see internal/reconcile's package doc for what
+	// this does and doesn't fix.
+	go runReconciler(ctx, db, redisClient, reconcileInterval)
+
+	srv := newServer(addr, db, redisClient, kafkaWriter, admissionTTL)
 
 	go func() {
-		log.Printf("checkout-api listening on %s (kafka brokers: %v)", addr, brokers)
+		log.Printf("checkout-api listening on %s (kafka brokers: %v, reconcile interval: %s)", addr, brokers, reconcileInterval)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("checkout-api: %v", err)
 		}
@@ -72,11 +100,49 @@ func main() {
 	log.Println("checkout-api: stopped")
 }
 
-func newServer(addr string, redisClient *redis.Client, kafkaWriter *kafka.Writer, admissionTTL time.Duration) *http.Server {
+// runReconciler re-seeds Redis inventory from Postgres every interval,
+// until ctx is cancelled. The very first pass is run synchronously in
+// main before this goroutine starts, so this loop's job is purely
+// correcting drift that accumulates afterward.
+func runReconciler(ctx context.Context, db *sql.DB, redisClient *redis.Client, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reconcileOnce(ctx, db, redisClient)
+		}
+	}
+}
+
+// reconcileOnce runs a single reconciliation pass over every active
+// item and logs a summary. One item's failure doesn't stop the rest
+// (see reconcile.All) -- this just reports whatever it found.
+func reconcileOnce(ctx context.Context, db *sql.DB, redisClient *redis.Client) {
+	outcomes, err := reconcile.All(ctx, db, redisClient)
+	if err != nil {
+		log.Printf("checkout-api: reconciling inventory: %v", err)
+		return
+	}
+
+	var failed int
+	for _, o := range outcomes {
+		if o.Err != nil {
+			failed++
+			log.Printf("checkout-api: reconciling item %s: %v", o.ItemID, o.Err)
+		}
+	}
+	log.Printf("checkout-api: reconciled %d item(s), %d failed", len(outcomes), failed)
+}
+
+func newServer(addr string, db *sql.DB, redisClient *redis.Client, kafkaWriter *kafka.Writer, admissionTTL time.Duration) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.HandleFunc("POST /items/{itemID}/checkout", handleCheckout(redisClient, kafkaWriter, admissionTTL))
-	mux.HandleFunc("POST /items/{itemID}/inventory", handleSeedInventory(redisClient))
+	mux.HandleFunc("POST /items/{itemID}/reconcile", handleReconcileItem(db, redisClient))
 	mux.HandleFunc("GET /items/{itemID}/inventory", handleGetInventory(redisClient))
 
 	return &http.Server{
@@ -210,15 +276,15 @@ func releaseAndRegrant(ctx context.Context, redisClient *redis.Client, itemID, u
 	}
 }
 
-type seedInventoryRequest struct {
-	Available int64 `json:"available"`
-}
-
-// handleSeedInventory exists only because this phase has no Postgres
-// wiring to seed Redis from yet -- Phase 9 replaces this with real
-// seeding/reconciliation from items.available_inventory. Treat this as
-// a test/dev-only endpoint, not part of the real buyer flow.
-func handleSeedInventory(redisClient *redis.Client) http.HandlerFunc {
+// handleReconcileItem forces an on-demand reconciliation of one item,
+// re-reading its authoritative available_inventory from Postgres and
+// overwriting Redis's fast-path copy to match. This is Phase 9's
+// replacement for Phase 4's manual seed endpoint: instead of trusting
+// an arbitrary number from the request body, the only input is which
+// item to refresh -- the value itself always comes from Postgres.
+// Useful right after seeding/adjusting an item in Postgres directly,
+// without waiting for the next scheduled reconciliation pass.
+func handleReconcileItem(db *sql.DB, redisClient *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		itemID := r.PathValue("itemID")
 		if itemID == "" {
@@ -226,25 +292,20 @@ func handleSeedInventory(redisClient *redis.Client) http.HandlerFunc {
 			return
 		}
 
-		var req seedInventoryRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			httpx.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		available, err := reconcile.Item(r.Context(), db, redisClient, itemID)
+		if errors.Is(err, reconcile.ErrItemNotFound) {
+			httpx.WriteError(w, http.StatusNotFound, "item not found")
 			return
 		}
-		if req.Available < 0 {
-			httpx.WriteError(w, http.StatusBadRequest, "available must not be negative")
-			return
-		}
-
-		if err := redisx.SeedInventory(r.Context(), redisClient, itemID, req.Available); err != nil {
-			log.Printf("checkout-api: seeding inventory for item %s: %v", itemID, err)
-			httpx.WriteError(w, http.StatusInternalServerError, "failed to seed inventory")
+		if err != nil {
+			log.Printf("checkout-api: reconciling item %s: %v", itemID, err)
+			httpx.WriteError(w, http.StatusInternalServerError, "failed to reconcile inventory")
 			return
 		}
 
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{
 			"item_id":   itemID,
-			"available": req.Available,
+			"available": available,
 		})
 	}
 }

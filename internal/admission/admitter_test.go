@@ -48,6 +48,63 @@ func TestAdmitsInFIFOOrder(t *testing.T) {
 	}
 }
 
+// TestDepthReflectsWaitingBuyers checks that Depth reports the number
+// of buyers who have joined but not yet been admitted, and that it
+// drops back down as the rate limiter admits them.
+func TestDepthReflectsWaitingBuyers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Slow enough that joins clearly outpace admits within this test.
+	a := NewAdmitter(ctx, 1)
+
+	if n, err := a.Depth(context.Background()); err != nil || n != 0 {
+		t.Fatalf("expected depth 0 before anyone joins, got %d (err %v)", n, err)
+	}
+
+	for i := 0; i < 3; i++ {
+		go func() {
+			_, admitted, err := a.Join(context.Background())
+			if err == nil {
+				<-admitted
+			}
+		}()
+	}
+
+	// Give the loop time to process all three join requests (it
+	// serializes them one at a time over the requests channel) before
+	// its first admit tick fires a second later.
+	deadline := time.After(500 * time.Millisecond)
+	for {
+		n, err := a.Depth(context.Background())
+		if err != nil {
+			t.Fatalf("Depth returned unexpected error: %v", err)
+		}
+		if n == 3 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expected depth to reach 3 waiting buyers, got %d", n)
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+}
+
+// TestDepthAfterShutdownReturnsError checks that Depth doesn't hang
+// forever if the admitter's loop has already exited.
+func TestDepthAfterShutdownReturnsError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	a := NewAdmitter(ctx, 10)
+	cancel()
+	a.Shutdown()
+
+	if _, err := a.Depth(context.Background()); err == nil {
+		t.Error("expected an error calling Depth after the admitter has shut down, got nil")
+	}
+}
+
 // TestJoinRespectsContextCancellation checks that a buyer whose context
 // is cancelled while waiting doesn't block Join forever.
 func TestJoinRespectsContextCancellation(t *testing.T) {
