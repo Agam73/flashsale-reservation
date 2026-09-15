@@ -53,3 +53,4 @@ logs/
 # --- Test / coverage artifacts ---
 coverage.out
 coverage.html
+*.zip
